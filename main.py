@@ -1,9 +1,11 @@
 """
-StudyOS — Personal AI Study Operating System
-Single-user. Telegram + Supabase + Gemini free
-tier + Render. Tables auto-create on boot.
-AI interprets language; Python computes every
-number.
+StudyOS v6 — Personal AI Study OS
+Single-user. Telegram + Supabase + Gemini
+free tier + Render. Schema auto-creates.
+AI interprets language; Python computes
+every number. All JSONB reads are
+defensive (jd()); all dates parse with
+years; all wizards expire.
 """
 
 import os
@@ -61,10 +63,30 @@ HTTP = httpx.AsyncClient(timeout=35.0)
 POOL = None
 AIC = None
 
+
 # ============================================================
-# DB SCHEMA — order matters:
-# 1) CREATE TABLEs  2) ALTERs (old DBs)
-# 3) indexes on altered columns LAST
+# SAFE JSONB DECODER — Supabase may return
+# jsonb as str OR dict depending on driver
+# state. Everything goes through this.
+# ============================================================
+def jd(v, default):
+    if v is None:
+        return default
+    if isinstance(v, (dict, list)):
+        return v
+    if isinstance(v, (str, bytes)):
+        try:
+            out = json.loads(v)
+            if isinstance(out, (dict, list)):
+                return out
+        except Exception:
+            pass
+    return default
+
+# ============================================================
+# DB SCHEMA — order: CREATEs, then ALTERs
+# (for pre-existing DBs), then the index on
+# the altered column LAST.
 # ============================================================
 SCHEMA = [
     """CREATE TABLE IF NOT EXISTS users (
@@ -329,14 +351,13 @@ SCHEMA = [
         created_at TIMESTAMPTZ
           DEFAULT now())""",
     # --- migrations for pre-existing DBs
-    # (MUST run before the index below)
+    # (must run BEFORE the index below)
     """ALTER TABLE pending_actions
        ADD COLUMN IF NOT EXISTS code TEXT""",
     """ALTER TABLE mistakes
        ADD COLUMN IF NOT EXISTS
        resolved_at TIMESTAMPTZ""",
-    # --- index on the migrated column:
-    # LAST, after the ALTER above
+    # --- index on migrated column: LAST
     """CREATE UNIQUE INDEX IF NOT EXISTS
        ix_pa_code
        ON pending_actions(user_id, code)""",
@@ -410,19 +431,7 @@ def esc(s):
     s = str(s if s is not None else "")
     return (s.replace("&", "&amp;")
              .replace("<", "&lt;")
-             .replace(">", "&gt;"))
-
-
-def obstate(v):
-    if isinstance(v, dict):
-        return v
-    if not v:
-        return {}
-    try:
-        out = json.loads(v)
-        return out if isinstance(out, dict) else {}
-    except Exception:
-        return {}
+             .replace(">", "&gt;")
 
 
 def trunc(s, n=3500):
@@ -625,7 +634,7 @@ def _load_json(text):
     return json.loads(text[i:j + 1])
 
 # ============================================================
-# DETERMINISTIC PARSERS (zero AI cost)
+# DETERMINISTIC PARSERS
 # ============================================================
 WEEKDAYS = {"monday": 0, "mon": 0,
             "tuesday": 1, "tue": 1,
@@ -648,18 +657,19 @@ SKIP_WORDS = {"skip", "/skip", "later",
               "n", "na"}
 
 
-def parse_any_date(text, today):
-    """ISO string OR natural words."""
-    t = (text or "").strip()
-    if not t:
-        return None
+def _try_date(y, mo, dd):
     try:
-        return date.fromisoformat(t)
+        return date(y, mo, dd)
     except ValueError:
-        return parse_date(t, today)
+        return None
 
 
 def parse_date(text, today):
+    """Handles: today, tomorrow, in N days,
+    weekday names, next/this weekday,
+    24 may 2027, may 24 2027, 24th may,
+    24/5/2027, 24-5-27, 2027-05-24,
+    24/5 (auto future year)."""
     t = (text or "").strip().lower()
     t = t.rstrip(".,!?")
     if not t:
@@ -668,8 +678,11 @@ def parse_date(text, today):
         return today
     if t in ("tomorrow", "tmrw", "tmr"):
         return today + timedelta(days=1)
-    if t == "day after tomorrow":
+    if t in ("day after tomorrow",
+             "day after"):
         return today + timedelta(days=2)
+    if t == "next week":
+        return today + timedelta(days=7)
     m = re.match(
         r"^in\s+(\d+)\s+days?$", t)
     if m:
@@ -682,45 +695,92 @@ def parse_date(text, today):
                  - today.weekday()) % 7
             return today + timedelta(
                 days=d if d else 7)
+    # ISO: 2027-05-24
     m = re.match(
-        r"^(\d{1,2})[\s\-/](\d{1,2})"
-        r"(?:[\s\-/](\d{2,4}))?$", t)
+        r"^(\d{4})-(\d{1,2})-(\d{1,2})$",
+        t)
     if m:
-        dd = int(m.group(1))
-        mo = int(m.group(2))
-        yy = today.year
-        if m.group(3):
-            yy = int(m.group(3))
-            yy += 2000 if yy < 100 else 0
-        try:
-            return date(yy, mo, dd)
-        except ValueError:
-            return None
+        return _try_date(int(m.group(1)),
+                         int(m.group(2)),
+                         int(m.group(3)))
+    # numeric: d/m/y or d-m-y or d.m.y
     m = re.match(
-        r"^(\d{1,2})"
-        r"(?:st|nd|rd|th)?"
-        r"\s+([a-z]+)$", t)
-    if m and m.group(2) in MONTHS:
-        try:
-            return date(today.year,
-                        MONTHS[m.group(2)],
-                        int(m.group(1)))
-        except ValueError:
+        r"^(\d{1,2})[/\-.](\d{1,2})"
+        r"[/\-.](\d{2,4})$", t)
+    if m:
+        d = int(m.group(1))
+        mo = int(m.group(2))
+        y = int(m.group(3))
+        y += 2000 if y < 100 else 0
+        if mo > 12 and d <= 12:
+            d, mo = mo, d
+        out = _try_date(y, mo, d)
+        if out:
+            return out
+        return None
+    # numeric no year: d/m
+    m = re.match(
+        r"^(\d{1,2})[/\-.](\d{1,2})$", t)
+    if m:
+        d = int(m.group(1))
+        mo = int(m.group(2))
+        if mo > 12 and d <= 12:
+            d, mo = mo, d
+        if not (1 <= mo <= 12
+                and 1 <= d <= 31):
             return None
-    for name, mo in MONTHS.items():
-        if t.startswith(name):
-            pat = ("^" + name
-                   + r"\s+(\d{1,2})"
-                     r"(?:st|nd|rd|th)?$")
-            m = re.match(pat, t)
-            if m:
-                try:
-                    return date(
-                        today.year, mo,
-                        int(m.group(1)))
-                except ValueError:
-                    return None
+        out = _try_date(today.year, mo, d)
+        if out is None:
+            return None
+        if out < today:
+            out = _try_date(today.year + 1,
+                            mo, d)
+        return out
+    # word month forms — token scan so
+    # extra words like "on"/"my" are ok
+    words = re.findall(r"[a-z]+|\d+", t)
+    month = None
+    nums = []
+    year = None
+    for w in words:
+        if w in MONTHS and month is None:
+            month = MONTHS[w]
+        elif w.isdigit():
+            n = int(w)
+            if len(w) == 4 \
+                    and 1990 <= n <= 2100:
+                year = n
+            else:
+                nums.append(n)
+    if month and nums:
+        day = None
+        for n in nums:
+            if 1 <= n <= 31:
+                day = n
+                break
+        if day:
+            y = year or today.year
+            out = _try_date(y, month, day)
+            if out is None and year is None:
+                out = _try_date(y + 1,
+                                month, day)
+            if out is None:
+                return None
+            if year is None and out < today:
+                out = _try_date(
+                    today.year + 1, month, day)
+            return out
     return None
+
+
+def parse_any_date(text, today):
+    t = (text or "").strip()
+    if not t:
+        return None
+    try:
+        return date.fromisoformat(t)
+    except ValueError:
+        return parse_date(t, today)
 
 
 def parse_time(t):
@@ -914,7 +974,7 @@ def compute_mastery(events):
     0.08*volume*source_weight);
     volume=log10(1+att)/log10(31).
     One event moves mastery
-    <= 15 points."""
+    <= 15 points. Recomputable."""
     if not events:
         return None
     m = 25.0
@@ -1032,9 +1092,8 @@ def score_task(c, now, energy):
             if hrs < 0:
                 s += 25
                 od = int(-hrs // 24) + 1
-                rs.append(
-                    "overdue ~"
-                    + str(od) + "d")
+                rs.append("overdue ~"
+                          + str(od) + "d")
             elif hrs <= 24:
                 s += 15
                 rs.append("due <24h")
@@ -1044,13 +1103,11 @@ def score_task(c, now, energy):
         rem = m.get("remaining")
         if rem:
             s += min(6, rem / 10)
-            rs.append(
-                str(rem)
-                + " questions left")
+            rs.append(str(rem)
+                      + " questions left")
     t_in = m.get("test_in_days")
     heavy = ("revision", "study",
-             "mistake_review",
-             "homework")
+             "mistake_review", "homework")
     if t_in is not None and t_in <= 14 \
             and k in heavy:
         if t_in <= 3:
@@ -1059,55 +1116,47 @@ def score_task(c, now, energy):
             s += 15
         else:
             s += 8
-        rs.append(
-            "test in " + str(t_in) + "d")
+        rs.append("test in "
+                  + str(t_in) + "d")
     if k == "revision":
         od = m.get("overdue_days") or 0
         if od > 0:
             s += min(20, 2 * od)
-            rs.append(
-                "revision overdue "
-                + str(od) + "d")
+            rs.append("revision overdue "
+                      + str(od) + "d")
         mast = m.get("mastery")
         if mast is not None and mast < 40:
             s += 10
-            rs.append(
-                "weak ("
-                + format(mast, ".0f")
-                + "%)")
+            rs.append("weak ("
+                      + format(mast, ".0f")
+                      + "%)")
         if m.get("mode") == "practice":
-            rs.append(
-                "needs active practice")
+            rs.append("needs active practice")
     if k == "mistake_review":
         r = m.get("reps") or 0
         if r:
             s += min(12, 2 * r)
-            rs.append(
-                str(r)
-                + " repeated mistake(s)")
+            rs.append(str(r)
+                      + " repeated mistake(s)")
     if k == "study":
         mast = m.get("mastery")
         if mast is not None and mast < 40:
             s += 8
-            rs.append(
-                "weak topic ("
-                + format(mast, ".0f")
-                + "%)")
+            rs.append("weak topic ("
+                      + format(mast, ".0f")
+                      + "%)")
         st = m.get("stale_days")
         if st and st > 14:
             s += 5
-            rs.append(
-                "untouched "
-                + str(st) + "d")
+            rs.append("untouched "
+                      + str(st) + "d")
     if energy in ("tired", "exhausted"):
         if k in LIGHT:
             s += 10
-            rs.append(
-                "light task fits energy")
+            rs.append("light task fits energy")
         else:
             s -= 10
-            rs.append(
-                "heavy — low energy today")
+            rs.append("heavy — low energy today")
     if c.get("subject"):
         pre = c["subject"]
         if c.get("chapter"):
@@ -1143,8 +1192,7 @@ def choose_next(scored, minutes,
 def day_minutes(u, day, mods=None):
     """available = awake − school −
     coaching − commute − meals −
-    10% buffer. mods: one-off
-    cancels/moves."""
+    10% buffer."""
     start = datetime.combine(
         day, u["wake_time"], tzinfo=TZ)
     end = datetime.combine(
@@ -1327,8 +1375,7 @@ def bar(pct, w=10):
 # ============================================================
 # DB SERVICES
 # ============================================================
-async def ensure_user(tg_from,
-                      chat_id):
+async def ensure_user(tg_from, chat_id):
     row = await qrow(
         """INSERT INTO users
            (telegram_user_id,
@@ -1380,8 +1427,7 @@ def resolve_subject(name, subjects):
     return None, None
 
 
-async def upsert_subject(user_id,
-                         name):
+async def upsert_subject(user_id, name):
     name = (name or "").strip().title()
     name = name or "General"
     r = await qrow(
@@ -1792,11 +1838,39 @@ async def cleanup_stale(u, now):
                 str(s["id"]))
 
 
-async def lazy_tick(u, now):
+async def lazy_tick(u, now, chat=None):
+    """Daily housekeeping. Sends a
+    morning card on the first message
+    of each day. Expires stale
+    wizards so they never trap
+    input."""
     today = now.date()
     if u.get("last_tick") == today:
         await cleanup_stale(u, now)
         return u
+    first_of_day = True
+    # expire stale pending wizards
+    await q(
+        """UPDATE pending_actions
+           SET status='cancelled'
+           WHERE user_id=$1::uuid
+           AND status='pending'
+           AND created_at <
+             now() - interval '24 hours'""",
+        u["id"])
+    await q(
+        """UPDATE pending_actions
+           SET status='cancelled'
+           WHERE user_id=$1::uuid
+           AND status='pending'
+           AND kind='session_log'
+           AND created_at <
+             now() - interval '2 hours'""",
+        u["id"])
+    await q(
+        """DELETE FROM update_inbox
+           WHERE created_at <
+             now() - interval '2 days'""")
     es = u.get("energy_set_at")
     if (u["energy"] != "normal" and es
             and (now - es)
@@ -1822,6 +1896,12 @@ async def lazy_tick(u, now):
         u["id"], today)
     u["last_tick"] = today
     await cleanup_stale(u, now)
+    if (first_of_day and chat
+            and u["onboarded"]):
+        try:
+            await morning_card(u, chat)
+        except Exception:
+            LOG.exception("morning card")
     return u
 
 # ============================================================
@@ -1842,23 +1922,22 @@ Intents and fields (null for unstated):
 - "hw_add": {"title","subject",
   "questions","minutes","due"} — due as
   natural words.
-- "hw_progress": {"title","done"}
+- "hw_progress": {"title","done"} — done
+  is a number, or the string "rest" if
+  they finished the rest.
 - "test_add": {"name","subject","date",
   "total_marks"}
 - "test_result": {"name","subject",
-  "obtained","total"}
+  "obtained","total","weak_topics":
+  ["topic names that went badly"]}
 - "mistake_add": {"subject","topic",
   "count","mtype"} — mtype: conceptual,
   calculation, careless, memory, misread,
   guessing, time_pressure.
 - "mistake_resolve": {"subject","topic"}
-  — they say they FIXED previous
-  mistakes.
 - "class_cancel": {"which","date"} —
-  which is "school" or "coaching"; date
-  natural words like "tomorrow".
-- "class_move": {"which","from","to"} —
-  e.g. moving tomorrow's class to friday.
+  which is "school" or "coaching".
+- "class_move": {"which","from","to"}
 - "energy": {"level"} — energetic|normal|
   tired|exhausted.
 - "quiz": {"topic","subject","count"}
@@ -2157,10 +2236,36 @@ async def do_hw_progress(u, f):
                "title with /homework.")
         return msg, False
     hw = rows[0]
-    done = int(f.get("done") or 0)
     total = hw["total_q"]
+    done_raw = f.get("done")
+    rest = False
+    if isinstance(done_raw, str):
+        dl = done_raw.strip().lower()
+        if dl in ("rest", "all",
+                  "remaining",
+                  "rest of it",
+                  "the rest"):
+            rest = True
+            if total:
+                done = total \
+                    - (hw["completed_q"]
+                       or 0)
+            else:
+                return ("How many "
+                        "questions does "
+                        "it have in "
+                        "total? Add it "
+                        "again with the "
+                        "count.", False)
+        else:
+            try:
+                done = int(dl)
+            except ValueError:
+                done = 0
+    else:
+        done = int(done_raw or 0)
     newc = (hw["completed_q"]
-            or 0) + done
+            or 0) + max(0, done)
     if total:
         newc = min(newc, total)
     completed = bool(
@@ -2182,6 +2287,8 @@ async def do_hw_progress(u, f):
                 + "]")
     if completed:
         tail = "done! 🎉"
+    elif rest:
+        tail = "rest logged."
     else:
         tail = "keep going."
     msg = ("📝 Progress saved: <b>"
@@ -2272,6 +2379,57 @@ async def do_test_result(u, f):
         ev_att, ev_cor, 0, "test",
         title="test: "
               + test["name"])
+    # bank weak topics as mistakes
+    banked = 0
+    weak = f.get("weak_topics") or []
+    if isinstance(weak, list):
+        for wname in weak[:8]:
+            wname = str(wname).strip()
+            if not wname \
+                    or not test[
+                        "subject_id"]:
+                continue
+            t = await find_topic(
+                u["id"],
+                test["subject_id"],
+                wname)
+            if not t:
+                t = await upsert_topic(
+                    u["id"],
+                    test["subject_id"],
+                    wname)
+            fp = hashlib.md5(
+                (str(u["id"]) + "|"
+                 + str(test[
+                     "subject_id"])
+                 + "|" + str(t["id"])
+                 + "|test_weakness"
+                 ).encode()).hexdigest()
+            await q(
+                """INSERT INTO mistakes
+                   (user_id, subject_id,
+                    topic_id, mtype,
+                    description, count,
+                    fingerprint)
+                   VALUES($1::uuid,
+                          $2::uuid,
+                          $3::uuid,
+                          'test_weakness',
+                          $4, 1, $5)
+                   ON CONFLICT
+                     (user_id,
+                      fingerprint)
+                   DO UPDATE SET
+                     count=mistakes.count
+                       +1,
+                     last_seen=now(),
+                     resolved=false""",
+                u["id"],
+                test["subject_id"],
+                t["id"],
+                ("weak in test: "
+                 + wname)[:200], fp)
+            banked += 1
     if pct >= 80:
         verdict = "strong 💪"
     elif pct >= 60:
@@ -2286,6 +2444,10 @@ async def do_test_result(u, f):
             + "%) — " + verdict
             + "\nRecorded as evidence "
             + "(test weight).")
+    if banked:
+        base += ("\n🧨 " + str(banked)
+                 + " weak topic(s) "
+                 "banked for revision.")
     try:
         prompt = ("A student scored "
                   + str(obt) + "/"
@@ -2329,6 +2491,7 @@ async def do_mistake_add(u, f):
              "memory", "misread",
              "guessing",
              "time_pressure",
+             "test_weakness",
              "unknown")
     mtype = f.get("mtype") or "unknown"
     if mtype not in valid:
@@ -2512,7 +2675,7 @@ async def do_save_note(u, f):
             "/notes to browse.")
 
 # ============================================================
-# PLAN REFRESH (dynamic replanning)
+# PLAN REFRESH
 # ============================================================
 async def refresh_plan(u, chat,
                        reason):
@@ -2572,6 +2735,144 @@ async def refresh_plan(u, chat,
                     "nav:next")]))
 
 # ============================================================
+# STATS GATHER (shared by analytics
+# and /review)
+# ============================================================
+async def gather_stats(u, days=7):
+    today = today_d()
+    wk_start = sod(
+        today - timedelta(days=days))
+    wk_end = sod(
+        today + timedelta(days=1))
+    prev_start = sod(
+        today - timedelta(
+            days=2 * days))
+    r = await qrow(
+        """SELECT COALESCE(
+                    SUM(
+                     duration_minutes),
+                    0) mins,
+                  COALESCE(
+                    SUM(
+                     questions_attempted),
+                    0) q,
+                  COALESCE(
+                    SUM(
+                     questions_correct),
+                    0) c
+           FROM study_sessions
+           WHERE user_id=$1::uuid
+           AND status='finished'
+           AND created_at >= $2
+           AND created_at < $3""",
+        u["id"], wk_start, wk_end)
+    prev = await qval(
+        """SELECT COALESCE(
+                    SUM(
+                     duration_minutes),
+                    0)
+           FROM study_sessions
+           WHERE user_id=$1::uuid
+           AND status='finished'
+           AND created_at >= $2
+           AND created_at < $3""",
+        u["id"], prev_start,
+        wk_start)
+    if not r:
+        return None
+    mins = int(r["mins"])
+    qn = int(r["q"])
+    cn = int(r["c"])
+    if mins == 0 and qn == 0:
+        return None
+    acc = (100.0 * cn / qn
+           if qn else 0)
+    subs = await qrows(
+        """SELECT s.name,
+                  SUM(ss
+                    .questions_attempted)
+                    q,
+                  SUM(ss
+                    .questions_correct)
+                    c
+           FROM study_sessions ss
+           JOIN subjects s
+             ON s.id=ss.subject_id
+           WHERE ss.user_id=$1::uuid
+           AND ss.status='finished'
+           AND ss.created_at >= $2
+           AND ss.created_at < $3
+           AND ss
+             .questions_attempted
+             > 0
+           GROUP BY s.name
+           ORDER BY SUM(
+             ss.questions_correct
+             )::float
+             / NULLIF(SUM(
+               ss
+               .questions_attempted),
+               0)
+             ASC""",
+        u["id"], wk_start, wk_end)
+    mast = await qrows(
+        """SELECT s.name subj,
+                  t.name top,
+                  m.mastery
+           FROM mastery m
+           JOIN topics t
+             ON t.id=m.topic_id
+           JOIN subjects s
+             ON s.id=m.subject_id
+           WHERE m.user_id=$1::uuid
+           AND m.events>0
+           ORDER BY m.mastery ASC
+           LIMIT 5""", u["id"])
+    dates = await qrows(
+        """SELECT DISTINCT
+                  created_at::date d
+           FROM study_sessions
+           WHERE user_id=$1::uuid
+           AND status='finished'
+           AND (duration_minutes
+                > 0
+                OR
+                questions_attempted
+                > 0)
+           ORDER BY d DESC
+           LIMIT 90""", u["id"])
+    streak = 0
+    if dates:
+        ds = {r2["d"]
+              for r2 in dates}
+        cur = today
+        if today not in ds:
+            cur = today - timedelta(
+                days=1)
+        while cur in ds:
+            streak += 1
+            cur -= timedelta(days=1)
+    rep = await qrows(
+        """SELECT t.name top,
+                  SUM(m.count) c
+           FROM mistakes m
+           JOIN topics t
+             ON t.id=m.topic_id
+           WHERE m.user_id=$1::uuid
+           AND m.resolved=false
+           GROUP BY t.name
+           ORDER BY c DESC
+           LIMIT 3""", u["id"])
+    return {
+        "days": days, "mins": mins,
+        "q": qn, "c": cn, "acc": acc,
+        "prev_mins": int(prev or 0),
+        "subs": [dict(s) for s in subs],
+        "mast": [dict(m) for m in mast],
+        "streak": streak,
+        "rep": [dict(x) for x in rep]}
+
+# ============================================================
 # COMMANDS / VIEWS
 # ============================================================
 MENU_KB = IK(
@@ -2605,19 +2906,20 @@ async def cmd_help(u, chat):
         "• \"add homework: DPP 3, "
         "40 questions, due "
         "friday\"\n"
-        "• \"did 25 of 50 DPP\"\n"
+        "• \"did 25 of 50 DPP\" / "
+        "\"did the rest of DPP\"\n"
         "• \"physics test on "
         "sunday\"\n"
         "• \"got 68 out of 75 in "
-        "physics test\"\n"
+        "physics test, weak in "
+        "rotation\"\n"
         "• \"made 3 conceptual "
         "mistakes in rotation\"\n"
         "• \"fixed my rotation "
         "mistakes\"\n"
         "• \"school is cancelled "
-        "tomorrow\"\n"
-        "• \"move coaching to "
-        "friday\"\n"
+        "tomorrow\" / \"move "
+        "coaching to friday\"\n"
         "• \"I'm exhausted\"\n"
         "• \"quiz me on "
         "thermodynamics\"\n"
@@ -2625,16 +2927,79 @@ async def cmd_help(u, chat):
         "motion\"\n"
         "• \"what should I "
         "study?\"\n\n"
+        "Settings by chat:\n"
+        "• \"wake at 6\" / \"sleep "
+        "at 11\"\n"
+        "• \"school 8-2 mon-sat\" / "
+        "\"coaching 5-8 mon,wed,fri\"\n"
+        "• \"exam on 24 may 2027\" / "
+        "\"call me Arjun\"\n\n"
         "Commands: /plan /next "
-        "/homework /tests "
-        "/revision /mistakes "
-        "/analytics /quiz /notes "
-        "/syllabus /settings\n\n"
-        "📷 Send a syllabus photo "
-        "to import it.\n"
-        "📄 Send a PDF syllabus.\n"
-        "🎙 Send a voice note.")
+        "/homework /tests /revision "
+        "/mistakes /analytics /quiz "
+        "/notes /syllabus /review "
+        "/settings /doctor\n\n"
+        "📷 syllabus photo · "
+        "📄 PDF · 🎙 voice note.")
     await send(chat, txt, MENU_KB)
+
+
+async def morning_card(u, chat):
+    today = today_d()
+    mods = await load_day_mods(
+        u["id"], today)
+    avail, _ = day_minutes(
+        u, today, mods)
+    name = (u["display_name"]
+            or u["first_name"]
+            or "there")
+    lines = [
+        "🌅 <b>Good morning, "
+        + esc(name) + "</b>",
+        today.strftime("%A, %d %b"),
+        "",
+        "Capacity today: <b>"
+        + fm(avail) + "</b>"]
+    nt = await qrow(
+        """SELECT name, test_at
+           FROM tests
+           WHERE user_id=$1::uuid
+           AND status='scheduled'
+           AND test_at >= now()
+           ORDER BY test_at
+           LIMIT 1""", u["id"])
+    if nt and nt["test_at"]:
+        d = (nt["test_at"]
+             - now_tz()).days
+        lines.append("🧪 " + esc(nt["name"])
+                     + " in " + str(d)
+                     + "d")
+    over = await qval(
+        """SELECT COUNT(*)
+           FROM homework
+           WHERE user_id=$1::uuid
+           AND status!='completed'
+           AND due_at<now()""",
+        u["id"])
+    if over:
+        lines.append("⚠️ " + str(over)
+                     + " homework "
+                       "overdue")
+    rv = await qval(
+        """SELECT COUNT(*)
+           FROM revisions
+           WHERE user_id=$1::uuid
+           AND due_at<now()""",
+        u["id"])
+    if rv:
+        lines.append("🔁 " + str(rv)
+                     + " revisions due")
+    await send(chat,
+               "\n".join(lines),
+               IK([("▶️ START NEXT",
+                    "nav:next"),
+                   ("📅 Plan",
+                    "nav:plan")]))
 
 
 async def cmd_dashboard(u, chat):
@@ -3308,7 +3673,8 @@ async def cmd_homework(u, chat):
         lines.append(line)
     lines += ["",
               "<i>Report: 'did 25 of "
-              "50 DPP'.</i>"]
+              "50 DPP' or 'did the "
+              "rest of DPP'.</i>"]
     await send(chat,
                "\n".join(lines),
                MENU_KB)
@@ -3397,12 +3763,16 @@ async def cmd_revision(u, chat):
     rows = await qrows(
         """SELECT rv.*,
                   s.name subj,
-                  t.name top
+                  t.name top,
+                  m.mastery
            FROM revisions rv
            LEFT JOIN subjects s
              ON s.id=rv.subject_id
            LEFT JOIN topics t
              ON t.id=rv.topic_id
+           LEFT JOIN mastery m
+             ON m.user_id=rv.user_id
+             AND m.topic_id=rv.topic_id
            WHERE rv.user_id=$1::uuid
            AND rv.due_at < now()
              + interval '2 days'
@@ -3435,11 +3805,19 @@ async def cmd_revision(u, chat):
                     + "d) 🔴")
         rt = r["rev_type"].replace(
             "_", " ")
+        mast = ""
+        if r["mastery"] is not None:
+            mast = (" — "
+                    + format(
+                        r["mastery"],
+                        ".0f")
+                    + "%")
         lines.append(
             "• "
             + esc(r["subj"] or "")
             + " / "
             + esc(r["top"] or "")
+            + mast
             + " — " + rt + over
             + mode)
     await send(chat,
@@ -3576,116 +3954,47 @@ async def cmd_notes(u, chat):
 
 async def cmd_analytics(u, chat,
                         days=7):
-    today = today_d()
-    wk_start = sod(
-        today - timedelta(
-            days=days))
-    wk_end = sod(
-        today + timedelta(days=1))
-    prev_start = sod(
-        today - timedelta(
-            days=2 * days))
-    r = await qrow(
-        """SELECT COALESCE(
-                    SUM(
-                     duration_minutes),
-                    0) mins,
-                  COALESCE(
-                    SUM(
-                     questions_attempted),
-                    0) q,
-                  COALESCE(
-                    SUM(
-                     questions_correct),
-                    0) c
-           FROM study_sessions
-           WHERE user_id=$1::uuid
-           AND status='finished'
-           AND created_at >= $2
-           AND created_at < $3""",
-        u["id"], wk_start, wk_end)
-    prev = await qval(
-        """SELECT COALESCE(
-                    SUM(
-                     duration_minutes),
-                    0)
-           FROM study_sessions
-           WHERE user_id=$1::uuid
-           AND status='finished'
-           AND created_at >= $2
-           AND created_at < $3""",
-        u["id"], prev_start,
-        wk_start)
-    if not r or (r["mins"] == 0
-                 and r["q"] == 0):
+    s = await gather_stats(u, days)
+    if s is None:
         await send(
             chat,
             "📊 Not enough data yet "
             "— log a few sessions "
             "first.", MENU_KB)
         return
-    mins = int(r["mins"])
-    qn = int(r["q"])
-    cn = int(r["c"])
-    acc = (100.0 * cn / qn
-           if qn else 0)
-    prev_i = int(prev or 0)
     ref = max(
-        days * 150,
-        int(prev_i * 120 // 100))
-    if mins >= prev_i:
+        s["days"] * 150,
+        int(s["prev_mins"]
+            * 120 // 100))
+    if s["mins"] >= s["prev_mins"]:
         trend = "↑"
     else:
         trend = "↓"
-    qref = days * 600 // 7
+    qref = s["days"] * 600 // 7
     lines = [
         "📊 <b>LAST "
-        + str(days) + " DAYS</b>",
+        + str(s["days"]) + " DAYS"
+        "</b>",
         "",
         "Study      "
         + bar(min(100,
-                  100 * mins / ref))
-        + " " + fm(mins) + " "
+                  100 * s["mins"]
+                  / ref))
+        + " " + fm(s["mins"]) + " "
         + trend,
         "Questions  "
         + bar(min(100,
-                  100 * qn / qref))
-        + " " + str(qn),
+                  100 * s["q"]
+                  / qref))
+        + " " + str(s["q"]),
         "Accuracy   "
-        + bar(acc) + " "
-        + format(acc, ".0f") + "%"]
-    subs = await qrows(
-        """SELECT s.name,
-                  SUM(ss
-                    .questions_attempted)
-                    q,
-                  SUM(ss
-                    .questions_correct)
-                    c
-           FROM study_sessions ss
-           JOIN subjects s
-             ON s.id=ss.subject_id
-           WHERE ss.user_id=$1::uuid
-           AND ss.status='finished'
-           AND ss.created_at >= $2
-           AND ss.created_at < $3
-           AND ss
-             .questions_attempted
-             > 0
-           GROUP BY s.name
-           ORDER BY SUM(
-             ss.questions_correct
-             )::float
-             / NULLIF(SUM(
-               ss
-               .questions_attempted),
-               0)
-             ASC""",
-        u["id"], wk_start, wk_end)
-    if subs:
+        + bar(s["acc"]) + " "
+        + format(s["acc"], ".0f")
+        + "%"]
+    if s["subs"]:
         lines += ["",
                   "<b>By subject</b>"]
-        for srow in subs:
+        for srow in s["subs"]:
             sa = 0
             if srow["q"]:
                 sa = (100
@@ -3700,24 +4009,11 @@ async def cmd_analytics(u, chat,
                 + "% ("
                 + str(srow["q"])
                 + "q)")
-    mast = await qrows(
-        """SELECT s.name subj,
-                  t.name top,
-                  m.mastery
-           FROM mastery m
-           JOIN topics t
-             ON t.id=m.topic_id
-           JOIN subjects s
-             ON s.id=m.subject_id
-           WHERE m.user_id=$1::uuid
-           AND m.events>0
-           ORDER BY m.mastery ASC
-           LIMIT 5""", u["id"])
-    if mast:
+    if s["mast"]:
         lines += ["",
                   "<b>Weakest "
                   "topics</b>"]
-        for m in mast:
+        for m in s["mast"]:
             mv = m["mastery"]
             lines.append(
                 "• "
@@ -3727,52 +4023,17 @@ async def cmd_analytics(u, chat,
                 + " — "
                 + format(mv, ".0f")
                 + "% " + bar(mv, 8))
-    dates = await qrows(
-        """SELECT DISTINCT
-                  created_at::date d
-           FROM study_sessions
-           WHERE user_id=$1::uuid
-           AND status='finished'
-           AND (duration_minutes
-                > 0
-                OR
-                questions_attempted
-                > 0)
-           ORDER BY d DESC
-           LIMIT 90""", u["id"])
-    streak = 0
-    if dates:
-        ds = {r["d"]
-              for r in dates}
-        cur = today
-        if today not in ds:
-            cur = today - timedelta(
-                days=1)
-        while cur in ds:
-            streak += 1
-            cur -= timedelta(days=1)
-    if streak:
+    if s["streak"]:
         lines += ["",
                   "🔥 <b>"
-                  + str(streak)
+                  + str(s["streak"])
                   + "-day streak</b>"]
-    rep = await qrows(
-        """SELECT t.name top,
-                  SUM(m.count) c
-           FROM mistakes m
-           JOIN topics t
-             ON t.id=m.topic_id
-           WHERE m.user_id=$1::uuid
-           AND m.resolved=false
-           GROUP BY t.name
-           ORDER BY c DESC
-           LIMIT 3""", u["id"])
-    if rep:
+    if s["rep"]:
         lines += ["",
                   "⚠️ <b>Repeated "
                   "errors</b>"]
         for i, r in enumerate(
-                rep, 1):
+                s["rep"], 1):
             lines.append(
                 str(i) + ". "
                 + esc(r["top"])
@@ -3784,6 +4045,190 @@ async def cmd_analytics(u, chat,
         [("🏠 Menu", "nav:menu")])
     await send(chat,
                "\n".join(lines), kb)
+
+
+async def cmd_review(u, chat):
+    s = await gather_stats(u, 7)
+    if s is None:
+        await send(chat,
+                   "📊 Not enough data "
+                   "for a review yet — "
+                   "log a few sessions "
+                   "first.", MENU_KB)
+        return
+    data = {
+        "study_minutes":
+            s["mins"],
+        "prev_week_minutes":
+            s["prev_mins"],
+        "questions": s["q"],
+        "accuracy_pct":
+            round(s["acc"], 1),
+        "streak_days": s["streak"],
+        "weakest_topics": [
+            {"subject": m["subj"],
+             "topic": m["top"],
+             "mastery": m["mastery"]}
+            for m in s["mast"][:5]],
+        "repeated_errors": [
+            {"topic": r["top"],
+             "count": r["c"]}
+            for r in s["rep"]]}
+    key = ("rv:"
+           + hashlib.md5(
+               json.dumps(
+                   data,
+                   sort_keys=True
+               ).encode()
+           ).hexdigest())
+    try:
+        txt = _cache_get(key)
+        if txt is None:
+            prompt = (
+                "Write a weekly study "
+                "review for this "
+                "student from these "
+                "EXACT stats (never "
+                "invent numbers): "
+                + json.dumps(data)
+                + "\nStructure: one "
+                "strength, one "
+                "concern, one focus "
+                "for next week. Max "
+                "90 words. Plain "
+                "text, warm but "
+                "honest.")
+            txt = await ai_call(
+                prompt,
+                json_mode=False,
+                max_tokens=300)
+            _cache_set(key, txt)
+        lines = ["📋 <b>WEEKLY "
+                 "REVIEW</b>", "",
+                 esc(txt.strip()),
+                 "",
+                 "Study " + fm(s["mins"])
+                 + " • "
+                 + str(s["q"])
+                 + " questions • "
+                 + format(s["acc"],
+                          ".0f")
+                 + "% accuracy"
+                 + (" • 🔥 "
+                    + str(s["streak"])
+                    + "d streak"
+                    if s["streak"]
+                    else "")]
+        await send(chat,
+                   "\n".join(lines),
+                   MENU_KB)
+    except AIError:
+        await cmd_analytics(
+            u, chat, days=7)
+
+
+async def cmd_doctor(u, chat):
+    lines = ["🩺 <b>StudyOS Doctor"
+             "</b>", ""]
+    ok_all = True
+    try:
+        await qval("SELECT 1")
+        lines.append("✅ Database: "
+                     "connected")
+        n = await qval(
+            """SELECT COUNT(*)
+               FROM study_sessions
+               WHERE user_id=
+                 $1::uuid""",
+            u["id"])
+        hw = await qval(
+            """SELECT COUNT(*)
+               FROM homework
+               WHERE user_id=$1::uuid
+               AND status NOT IN
+                 ('completed',
+                  'abandoned')""",
+            u["id"])
+        rv = await qval(
+            """SELECT COUNT(*)
+               FROM revisions
+               WHERE user_id=$1::uuid
+               AND due_at < now()""",
+            u["id"])
+        lines.append(
+            "   sessions: "
+            + str(n)
+            + " • open hw: "
+            + str(hw)
+            + " • rev due: "
+            + str(rv))
+    except Exception as e:
+        ok_all = False
+        lines.append("❌ Database: "
+                     + esc(str(e)[:120]))
+    lines.append("🕒 Time: "
+                 + now_tz().strftime(
+                     "%d %b %Y %H:%M")
+                 + " (" + TZ_NAME + ")")
+    lines.append("👤 Onboarded: "
+                 + ("yes"
+                    if u["onboarded"]
+                    else "NO — /start"))
+    try:
+        t0 = time.monotonic()
+        await ai_call(
+            "Reply with exactly: OK",
+            json_mode=False,
+            max_tokens=10)
+        lines.append("✅ Gemini: "
+                     + str(int(
+                         (time.monotonic()
+                          - t0) * 1000))
+                     + "ms")
+    except Exception as e:
+        ok_all = False
+        lines.append("❌ Gemini: "
+                     + esc(str(e)[:120]))
+    try:
+        info = await tg("getWebhookInfo")
+        if info and info.get("url"):
+            lines.append("✅ Webhook: "
+                         "registered")
+            pc = info.get(
+                "pending_update_count",
+                0)
+            if pc:
+                lines.append(
+                    "   pending updates: "
+                    + str(pc))
+        else:
+            ok_all = False
+            lines.append("❌ Webhook: "
+                         "not set")
+    except Exception:
+        lines.append("⚠️ Webhook: "
+                     "couldn't check")
+    try:
+        errs = await qrows(
+            """SELECT error
+               FROM ai_log
+               WHERE status='error'
+               ORDER BY id DESC
+               LIMIT 3""")
+        if errs:
+            lines.append(
+                "ℹ️ recent AI errors: "
+                + str(len(errs)))
+    except Exception:
+        pass
+    lines += ["",
+              ("ALL SYSTEMS GO ✅"
+               if ok_all
+               else "Needs "
+                    "attention ⚠️")]
+    await send(chat,
+               "\n".join(lines),
+               MENU_KB)
 
 
 async def cmd_settings(u, chat):
@@ -3827,14 +4272,20 @@ async def cmd_settings(u, chat):
             + u["coaching_end"]
             .strftime("%H:%M"))
     lines.append(
+        "🍱 Meals: "
+        + str(u["meal_minutes"])
+        + "m • 🚌 Commute: "
+        + str(u["commute_minutes"])
+        + "m")
+    lines.append(
         "⚡ Energy: "
         + u["energy"])
     lines += ["",
-              "<i>Editable by "
-              "telling me, e.g. "
-              "'wake at 6' or "
-              "'school 8-2 "
-              "mon-sat'.</i>"]
+              "<i>Change by chat: "
+              "'wake at 6', 'sleep "
+              "at 11', 'school 8-2 "
+              "mon-sat', 'exam on "
+              "24 may 2027'.</i>"]
     await send(chat,
                "\n".join(lines),
                IK([("🔄 Restart "
@@ -3848,8 +4299,6 @@ async def cmd_settings(u, chat):
 # QUIZ
 # ============================================================
 async def quiz_label(u):
-    """Weakest topic with data,
-    else any topic, else mixed."""
     r = await qrow(
         """SELECT s.name subj,
                   t.name top
@@ -3924,8 +4373,8 @@ async def start_quiz(
         "Return ONLY JSON: "
         + '{"questions":'
         + '[{"question":"...",'
-        + '"options":['
-        + '"a","b","c","d"],'
+        + '"options":'
+        + '["a","b","c","d"],'
         + '"answer":0,'
         + '"explanation":'
         + '"short why"}]} '
@@ -3957,6 +4406,7 @@ async def start_quiz(
             "again in a minute.",
             MENU_KB)
         return
+    raw = jd(raw, {})
     qs = []
     for x in (raw.get("questions")
               or [])[:count]:
@@ -4066,10 +4516,9 @@ async def quiz_answer(
             or row["status"] \
             != "active":
         return
-    qs = json.loads(
-        row["questions"])
-    answers = json.loads(
-        row["answers"])
+    qs = jd(row["questions"], [])
+    answers = jd(row["answers"],
+                 [])
     if len(answers) != qi:
         return
     answers.append(opt)
@@ -4169,7 +4618,9 @@ OB_STEPS = [
      True, "text"),
     ("exam_date",
      "📅 Main exam date?\n"
-     "(e.g. '24 may 2027')\n"
+     "(e.g. '24 may 2027', "
+     "'24/5/2027', or "
+     "'may 24')\n"
      "/skip if not fixed",
      False, "date"),
     ("subjects",
@@ -4180,11 +4631,12 @@ OB_STEPS = [
      True, "subjects"),
     ("wake",
      "🌅 Wake time? "
-     "(e.g. '6:30')",
+     "(e.g. '6:30' or '6am')",
      True, "time"),
     ("sleep",
      "🌙 Sleep time? "
-     "(e.g. '23:00')",
+     "(e.g. '23:00' or "
+     "'11pm')",
      True, "time"),
     ("school",
      "🏫 School hours?\n"
@@ -4198,6 +4650,16 @@ OB_STEPS = [
      "/skip if none",
      False, "class"),
 ]
+
+OB_LABELS = {
+    "name": "👤 Name",
+    "exam": "🎯 Goal",
+    "exam_date": "📅 Exam date",
+    "subjects": "📚 Subjects",
+    "wake": "🌅 Wake",
+    "sleep": "🌙 Sleep",
+    "school": "🏫 School",
+    "coaching": "📖 Coaching"}
 
 
 async def ob_start(u, chat):
@@ -4221,8 +4683,12 @@ async def ob_start(u, chat):
         + first[1])
 
 
+def ob_state(u):
+    return jd(u.get("ob_state"), {})
+
+
 async def ob_summary(u, chat):
-    st = u["ob_state"] or {}
+    st = ob_state(u)
     lines = ["<b>Here's what "
              "I've understood."
              "</b>", ""]
@@ -4259,12 +4725,22 @@ async def ob_summary(u, chat):
         + " – "
         + str(st.get("sleep")))
     lines += ["", "All correct?"]
+    kb_rows = [[("✅ Confirm",
+                 "ob:confirm")]]
+    edit_row = []
+    for key in OB_STEPS:
+        label = OB_LABELS[
+            key[0]]
+        edit_row.append(
+            (label, "ob:g:"
+             + key[0]))
+    kb_rows.append(edit_row)
+    kb_rows.append(
+        [("🔄 Start over",
+          "ob:restart")])
     await send(chat,
                "\n".join(lines),
-               IK([("✅ Confirm",
-                    "ob:confirm")],
-                  [("🔄 Start over",
-                    "ob:restart")]))
+               IK(*kb_rows))
 
 
 def ob_next_step(key):
@@ -4290,8 +4766,8 @@ async def ob_prompt(u, chat, step):
 
 
 async def ob_handle(u, chat, text):
-    st = obstate(u["ob_state"])
-    step = u["ob_step"]
+    st = dict(ob_state(u))
+    step = u.get("ob_step")
     if not step:
         first = OB_STEPS[0]
         await q(
@@ -4345,8 +4821,9 @@ async def ob_handle(u, chat, text):
             await send(
                 chat,
                 "Couldn't read that "
-                "date — try "
-                "'24 may 2027'.")
+                "date. Try '24 may "
+                "2027', '24/5/2027' "
+                "or 'may 24'.")
             return
         st[key] = d.isoformat()
     elif kind == "subjects":
@@ -4368,7 +4845,7 @@ async def ob_handle(u, chat, text):
             await send(
                 chat,
                 "Try a time like "
-                "'6:30'.")
+                "'6:30' or '11pm'.")
             return
         st[key] = tm.strftime(
             "%H:%M")
@@ -4400,7 +4877,7 @@ async def ob_handle(u, chat, text):
 
 
 async def ob_commit(u, chat):
-    st = obstate(u["ob_state"])
+    st = ob_state(u)
     for name in (st.get("subjects")
                  or [])[:8]:
         await upsert_subject(
@@ -4414,7 +4891,9 @@ async def ob_commit(u, chat):
                 date.fromisoformat(
                     st["exam_date"])
         except ValueError:
-            pass
+            exam_d = parse_any_date(
+                str(st["exam_date"]),
+                today_d())
     wake = parse_time(
         st.get("wake") or "06:30")
     if not wake:
@@ -4551,6 +5030,7 @@ async def handle_photo(u, chat,
             "again in a minute.",
             MENU_KB)
         return
+    raw = jd(raw, {})
     ptype = (raw.get("type")
              or "unknown").lower()
     conf = (raw.get("confidence")
@@ -4598,7 +5078,7 @@ async def handle_photo(u, chat,
         return
     if ptype == "test" \
             and raw.get("test"):
-        t = raw["test"]
+        t = jd(raw["test"], {})
         f = {k: v
              for k, v in
              t.items()
@@ -4625,7 +5105,8 @@ async def handle_photo(u, chat,
         return
     if ptype == "homework" \
             and raw.get("homework"):
-        h = raw["homework"]
+        h = jd(raw["homework"],
+               {})
         f = {k: v
              for k, v in
              h.items()
@@ -4756,6 +5237,7 @@ async def handle_document(
             "again in a minute.",
             MENU_KB)
         return
+    raw = jd(raw, {})
     blocks = raw.get("blocks") or []
     if blocks:
         blocks = blocks[:12]
@@ -4856,6 +5338,227 @@ async def handle_voice(u, chat,
         u, chat, text)
 
 # ============================================================
+# SETTINGS BY CHAT (deterministic)
+# ============================================================
+BANNED = ("cancel", "move",
+          "moved", "holiday",
+          "off", "skip",
+          "tomorrow", "test",
+          "homework", "hw",
+          "quiz")
+
+
+async def try_settings(
+        u, chat, t, low):
+    if not u["onboarded"]:
+        return False
+    # name
+    m = re.search(
+        r"call me ([a-zA-Z ]{2,30})",
+        low)
+    if m:
+        nm = m.group(1).strip() \
+            .title()[:40]
+        await q(
+            """UPDATE users
+               SET display_name=$2
+               WHERE id=$1::uuid""",
+            u["id"], nm)
+        await send(
+            chat,
+            "👤 Got it, "
+            + esc(nm) + ".",
+            MENU_KB)
+        return True
+    # wake / sleep
+    m = re.search(
+        r"\bwake(?:\s*up)?"
+        r"\s*(?:at|by)?\s*"
+        r"(\d{1,2})"
+        r"(?::(\d{2}))?"
+        r"\s*(am|pm)?\b", low)
+    if m:
+        tm = parse_time(
+            m.group(1) + ":"
+            + (m.group(2) or "00"))
+        ap = m.group(3)
+        h = int(m.group(1))
+        if tm and not ap:
+            if h < 12:
+                tm = dtime(h, 0)
+            else:
+                tm = dtime(h, 0)
+        if tm and ap:
+            tm = parse_time(
+                m.group(1)
+                + (m.group(2) or "")
+                + ap)
+        if tm:
+            await q(
+                """UPDATE users
+                   SET wake_time=$2
+                   WHERE id=$1::uuid""",
+                u["id"], tm)
+            await send(
+                chat,
+                "🌅 Wake time set to "
+                + tm.strftime("%H:%M")
+                + ".",
+                MENU_KB)
+            return True
+    m = re.search(
+        r"\bsleep(?:ing)?"
+        r"\s*(?:at|by)?\s*"
+        r"(\d{1,2})"
+        r"(?::(\d{2}))?"
+        r"\s*(am|pm)?\b", low)
+    if m:
+        h = int(m.group(1))
+        ap = m.group(3)
+        mi = m.group(2) or "00"
+        if not ap and 1 <= h <= 11:
+            # "sleep at 11" => 11pm
+            tm = dtime(h + 12, 0)
+        else:
+            tm = parse_time(
+                m.group(1) + ":"
+                + mi + (ap or ""))
+        if tm:
+            await q(
+                """UPDATE users
+                   SET sleep_time=$2
+                   WHERE id=$1::uuid""",
+                u["id"], tm)
+            await send(
+                chat,
+                "🌙 Sleep time set to "
+                + tm.strftime("%H:%M")
+                + " (assumed pm — "
+                "say 'sleep at 11am' "
+                "to correct).",
+                MENU_KB)
+            return True
+    # exam date
+    m = re.search(
+        r"exam(?:\s+date)?"
+        r"\s+(?:is|on)\s+(.+)",
+        low)
+    if m:
+        d = parse_any_date(
+            m.group(1).strip(),
+            today_d())
+        if d:
+            await q(
+                """UPDATE users
+                   SET exam_date=$2
+                   WHERE id=$1::uuid""",
+                u["id"], d)
+            await send(
+                chat,
+                "🎯 Exam date set: "
+                + d.strftime(
+                    "%a %d %b %Y")
+                + " ("
+                + str((d
+                       - today_d())
+                      .days)
+                + " days away).",
+                MENU_KB)
+            return True
+    # school / coaching hours
+    if (("school" in low
+         or "coaching" in low)
+            and not any(
+                b in low
+                for b in BANNED)):
+        pc = parse_class(t)
+        if pc:
+            if "coaching" in low:
+                cols = ("coaching_"
+                        "start",
+                        "coaching_"
+                        "end",
+                        "coaching_"
+                        "days")
+                word = "Coaching"
+            else:
+                cols = ("school_"
+                        "start",
+                        "school_"
+                        "end",
+                        "school_"
+                        "days")
+                word = "School"
+            await q(
+                """UPDATE users SET
+                   """ + cols[0]
+                + "=$2, "
+                + cols[1]
+                + "=$3, "
+                + cols[2]
+                + """=$4
+                   WHERE id=$1::uuid""",
+                u["id"], pc[0],
+                pc[1], pc[2])
+            days = ", ".join(
+                ["Mon", "Tue", "Wed",
+                 "Thu", "Fri", "Sat",
+                 "Sun"][d]
+                for d in pc[2]) or "daily"
+            await send(
+                chat,
+                "🗓 " + word
+                + " set: "
+                + pc[0].strftime(
+                    "%H:%M")
+                + "–"
+                + pc[1].strftime(
+                    "%H:%M")
+                + " (" + days
+                + "). Your capacity "
+                "recalculates "
+                "instantly.",
+                MENU_KB)
+            return True
+    # meals / commute
+    m = re.search(
+        r"\bmeals?\b[^0-9]{0,20}"
+        r"(\d{2,3})\b", low)
+    if m:
+        v = clampi(m.group(1),
+                   0, 300)
+        await q(
+            """UPDATE users
+               SET meal_minutes=$2
+               WHERE id=$1::uuid""",
+            u["id"], v)
+        await send(chat,
+                   "🍱 Meals: "
+                   + str(v)
+                   + " minutes.",
+                   MENU_KB)
+        return True
+    m = re.search(
+        r"\bcommute\b[^0-9]{0,20}"
+        r"(\d{2,3})\b", low)
+    if m:
+        v = clampi(m.group(1),
+                   0, 300)
+        await q(
+            """UPDATE users
+               SET commute_minutes
+                   =$2
+               WHERE id=$1::uuid""",
+            u["id"], v)
+        await send(chat,
+                   "🚌 Commute: "
+                   + str(v)
+                   + " minutes.",
+                   MENU_KB)
+        return True
+    return False
+
+# ============================================================
 # TEXT ROUTING
 # ============================================================
 async def handle_text_msg(
@@ -4944,6 +5647,16 @@ async def handle_text_msg(
         await cmd_settings(
             u, chat)
         return
+    if cmd == "review":
+        await cmd_review(u, chat)
+        return
+    if cmd == "doctor":
+        await cmd_doctor(u, chat)
+        return
+    # ---- settings by chat ----
+    if await try_settings(
+            u, chat, t, low):
+        return
     # ---- deterministic fast paths ----
     energy = detect_energy(t)
     if energy \
@@ -4995,7 +5708,8 @@ async def handle_text_msg(
         return
     stud = re.search(
         r"\b(studied|revised|"
-        r"solved|did)\b", low)
+        r"solved|did|study)\b",
+        low)
     if stud \
             and parse_duration(t) \
             and not pq:
@@ -5021,9 +5735,11 @@ async def handle_text_msg(
             "(Buttons still work: "
             "🏠)", MENU_KB)
         return
+    routed = jd(routed, {})
     intent = (routed.get("intent")
               or "none").lower()
-    f = routed.get("fields") or {}
+    f = jd(routed.get("fields"),
+           {})
     conf = (routed.get(
         "confidence")
         or "medium").lower()
@@ -5130,12 +5846,18 @@ async def handle_text_msg(
         title = esc(
             f.get("title")
             or "homework")
+        done = f.get("done")
+        if isinstance(done, str):
+            dl = done.lower()
+            if dl in ("rest", "all",
+                      "remaining"):
+                done = "the rest"
         await send(
             chat,
             "📝 <b>" + title
             + "</b>\nDone now: <b>"
-            + str(f.get("done"))
-            + "</b> more",
+            + str(done)
+            + "</b>",
             confirm_kb(code))
         return
     if intent == "test_add":
@@ -5157,7 +5879,16 @@ async def handle_text_msg(
                   "Obtained"),
                  ("total", "Total")]
         lines = card_lines(
-            f, order)
+            clean, order)
+        if clean.get("weak_topics"):
+            wt = ", ".join(
+                str(x)
+                for x in
+                clean["weak_topics"]
+                [:6])
+            lines.append(
+                "Weak topics: <b>"
+                + esc(wt) + "</b>")
         flag = ""
         if conf != "high":
             flag = " ⚠️"
@@ -5210,8 +5941,7 @@ async def handle_text_msg(
             intent, conf)
         return
     if intent == "syllabus":
-        blocks = (f.get("blocks")
-                  or [])
+        blocks = f.get("blocks") or []
         if not blocks:
             await cmd_syllabus(
                 u, chat)
@@ -5792,7 +6522,7 @@ async def candidate_class(
 # ============================================================
 async def wizard_session_log(
         u, chat, pend, text):
-    code = pend["code"]
+    pid = str(pend["id"])
     if text.lower().startswith(
             "/skip"):
         await q(
@@ -5800,8 +6530,8 @@ async def wizard_session_log(
                pending_actions
                SET status=
                  'confirmed'
-               WHERE code=$1""",
-            code)
+               WHERE id=$1::uuid""",
+            pid)
         await send(
             chat,
             "Logged as time-only. "
@@ -5822,8 +6552,8 @@ async def wizard_session_log(
             cor = pq[1]
     if att and cor is not None \
             and cor <= att:
-        payload = json.loads(
-            pend["payload"])
+        payload = jd(
+            pend["payload"], {})
         sess_id = payload.get(
             "session_id")
         await q(
@@ -5901,8 +6631,8 @@ async def wizard_session_log(
                pending_actions
                SET status=
                  'confirmed'
-               WHERE code=$1""",
-            code)
+               WHERE id=$1::uuid""",
+            pid)
         accp = 100 * cor // att
         lines = ["✅ Logged: "
                  + str(att)
@@ -6061,7 +6791,7 @@ async def handle_callback(cb):
     u = await ensure_user(
         cb["from"], chat)
     u = await lazy_tick(
-        u, now_tz())
+        u, now_tz(), chat)
     await answer_cb(cb["id"])
     scope, _, rest = \
         data.partition(":")
@@ -6178,10 +6908,19 @@ async def go_cb(u, chat, rest):
     if not pend \
             or pend["status"] \
             != "pending":
+        await send(
+            chat,
+            "⏳ That suggestion "
+            "expired — ask me "
+            "again ('what should "
+            "I study?').",
+            MENU_KB)
         return
-    payload = json.loads(
-        pend["payload"])
-    cand = payload["cand"]
+    payload = jd(
+        pend["payload"], {})
+    cand = payload.get("cand")
+    if not cand:
+        return
     if mode == "alt":
         await q(
             """UPDATE
@@ -6214,6 +6953,9 @@ async def go_cb(u, chat, rest):
                       "errors "
                       "students make "
                       "here")
+        elif rt == "mcq":
+            flavor = ("quick "
+                      "recall style")
         await start_quiz(
             u, chat,
             meta.get("topic"),
@@ -6229,7 +6971,9 @@ async def go_cb(u, chat, rest):
             u, chat, cand)
 
 
-async def ob_cb(u, chat, what):
+async def ob_cb(u, chat, rest):
+    what, _, arg = \
+        rest.partition(":")
     if what == "confirm":
         if not u["onboarded"]:
             await ob_commit(
@@ -6237,6 +6981,17 @@ async def ob_cb(u, chat, what):
         else:
             await cmd_dashboard(
                 u, chat)
+    elif what == "g":
+        keys = [s[0]
+                for s in OB_STEPS]
+        if arg in keys:
+            await q(
+                """UPDATE users
+                   SET ob_step=$2
+                   WHERE id=$1::uuid""",
+                u["id"], arg)
+            await ob_prompt(
+                u, chat, arg)
     elif what == "restart":
         await q(
             """UPDATE users SET
@@ -6303,8 +7058,8 @@ async def subj_cb(u, chat, rest):
             or pend["status"] \
             != "pending":
         return
-    payload = json.loads(
-        pend["payload"])
+    payload = jd(
+        pend["payload"], {})
     sname = await qval(
         """SELECT name
            FROM subjects
@@ -6312,50 +7067,54 @@ async def subj_cb(u, chat, rest):
         sid)
     if not sname:
         return
-    payload["fields"][
-        "subject_id"] = sid
-    payload["fields"][
-        "subject"] = sname
+    fields = payload.get(
+        "fields") or {}
+    fields["subject_id"] = sid
+    fields["subject"] = sname
+    payload["fields"] = fields
     await set_pending_payload(
         code, payload)
     kind = pend["kind"]
-    f = payload["fields"]
     if kind == "log_session":
         lines = ["I found:", ""]
-        if f.get("questions"):
+        if fields.get("questions"):
             lines.append(
                 "Questions: <b>"
                 + str(
-                    f["questions"])
+                    fields[
+                        "questions"])
                 + "</b>")
-            if f.get("correct") \
+            if fields.get(
+                    "correct") \
                     is not None:
                 lines.append(
                     "Correct: <b>"
                     + str(
-                        f["correct"
-                          ])
+                        fields[
+                            "correct"
+                        ])
                     + "</b>")
-        if f.get("minutes"):
+        if fields.get("minutes"):
             lines.append(
                 "Duration: <b>"
                 + fm(
-                    f["minutes"])
+                    fields[
+                        "minutes"])
                 + "</b>")
         lines.append(
             "Subject: <b>"
             + esc(sname)
             + "</b>")
-        if f.get("topic"):
+        if fields.get("topic"):
             lines.append(
                 "Topic: <b>"
                 + esc(
-                    f["topic"])
+                    fields[
+                        "topic"])
                 + "</b>")
-        await send(
-            chat,
-            "\n".join(lines),
-            confirm_kb(code))
+        await send(chat,
+                   "\n".join(lines),
+                   confirm_kb(code))
         return
     orders = {
         "hw_add": [
@@ -6377,12 +7136,12 @@ async def subj_cb(u, chat, rest):
              "Subject"),
             ("topic", "Topic")]}
     lines = card_lines(
-        f, orders.get(kind, []))
-    await send(
-        chat,
-        "I found:\n\n"
-        + "\n".join(lines),
-        confirm_kb(code))
+        fields,
+        orders.get(kind, []))
+    await send(chat,
+               "I found:\n\n"
+               + "\n".join(lines),
+               confirm_kb(code))
 
 
 async def confirm_cb(
@@ -6394,15 +7153,21 @@ async def confirm_cb(
     if not pend \
             or pend["status"] \
             != "pending":
+        await edit(
+            chat, msg_id,
+            "⏳ This expired — "
+            "send the message "
+            "again.")
         return
-    payload = json.loads(
-        pend["payload"])
+    payload = jd(
+        pend["payload"], {})
+    fields = payload.get(
+        "fields") or {}
     kind = pend["kind"]
     if answer in ("no", "undo"):
         if answer == "undo" \
                 and kind \
                 == "undo_log":
-            f = payload["fields"]
             await q(
                 """DELETE
                    FROM
@@ -6421,10 +7186,12 @@ async def confirm_cb(
                      IS NOT DISTINCT
                      FROM $3""",
                 u["id"],
-                f.get("questions")
+                fields.get(
+                    "questions")
                 or 0,
-                f.get("correct"))
-            sid = f.get(
+                fields.get(
+                    "correct"))
+            sid = fields.get(
                 "subject_id")
             if sid:
                 await recompute(
@@ -6476,14 +7243,11 @@ async def confirm_cb(
     if kind == "log_session":
         res = await \
             do_log_session(
-                u,
-                payload["fields"])
+                u, fields)
         ucode = await \
             new_pending(
                 u, "undo_log",
-                {"fields":
-                 payload[
-                     "fields"]},
+                {"fields": fields},
                 "confirm")
         undo = ("cfm:" + ucode
                 + ":undo")
@@ -6495,16 +7259,14 @@ async def confirm_cb(
         await edit(
             chat, msg_id,
             await do_hw_add(
-                u,
-                payload["fields"]))
+                u, fields))
         await refresh_plan(
             u, chat,
             "homework added")
     elif kind == "hw_progress":
         msg, completed = \
             await do_hw_progress(
-                u,
-                payload["fields"])
+                u, fields)
         await edit(
             chat, msg_id, msg)
         if completed:
@@ -6515,8 +7277,7 @@ async def confirm_cb(
         await edit(
             chat, msg_id,
             await do_test_add(
-                u,
-                payload["fields"]))
+                u, fields))
         await refresh_plan(
             u, chat,
             "test added")
@@ -6524,28 +7285,24 @@ async def confirm_cb(
         await edit(
             chat, msg_id,
             await do_test_result(
-                u,
-                payload["fields"]))
+                u, fields))
     elif kind == "mistake_add":
         await edit(
             chat, msg_id,
             await do_mistake_add(
-                u,
-                payload["fields"]))
+                u, fields))
     elif kind == \
             "mistake_resolve":
         await edit(
             chat, msg_id,
             await
             do_mistake_resolve(
-                u,
-                payload["fields"]))
+                u, fields))
     elif kind == "class_op":
         await edit(
             chat, msg_id,
             await do_class_op(
-                u,
-                payload["fields"]))
+                u, fields))
         await refresh_plan(
             u, chat,
             "schedule changed")
@@ -6555,13 +7312,13 @@ async def confirm_cb(
             await do_syllabus(
                 u,
                 payload.get(
-                    "blocks", [])))
+                    "blocks",
+                    [])))
     elif kind == "save_note":
         await edit(
             chat, msg_id,
             await do_save_note(
-                u,
-                payload["fields"]))
+                u, fields))
     else:
         await edit(
             chat, msg_id,
@@ -6583,7 +7340,7 @@ async def process_message(msg):
         u = await ensure_user(
             msg["from"], chat)
         u = await lazy_tick(
-            u, now_tz())
+            u, now_tz(), chat)
         if msg.get("voice"):
             await handle_voice(
                 u, chat, msg)
@@ -6764,3 +7521,11 @@ if __name__ == "__main__":
         app, host="0.0.0.0",
         port=int(
             os.getenv("PORT", 8000)))
+
+# ============================================================
+# END OF FILE — StudyOS v6
+# If you can see this marker TWICE
+# in your file, you pasted the code
+# more than once. Select ALL, delete,
+# and paste once.
+# ============================================================
