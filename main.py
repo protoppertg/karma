@@ -413,6 +413,18 @@ def esc(s):
              .replace(">", "&gt;"))
 
 
+def obstate(v):
+    if isinstance(v, dict):
+        return v
+    if not v:
+        return {}
+    try:
+        out = json.loads(v)
+        return out if isinstance(out, dict) else {}
+    except Exception:
+        return {}
+
+
 def trunc(s, n=3500):
     return s if len(s) <= n \
         else s[:n] + "\n…"
@@ -4278,7 +4290,7 @@ async def ob_prompt(u, chat, step):
 
 
 async def ob_handle(u, chat, text):
-    st = dict(u["ob_state"] or {})
+    st = obstate(u["ob_state"])
     step = u["ob_step"]
     if not step:
         first = OB_STEPS[0]
@@ -4388,7 +4400,7 @@ async def ob_handle(u, chat, text):
 
 
 async def ob_commit(u, chat):
-    st = u["ob_state"] or {}
+    st = obstate(u["ob_state"])
     for name in (st.get("subjects")
                  or [])[:8]:
         await upsert_subject(
