@@ -308,8 +308,9 @@ def trunc(s, n=3500) -> str:
 
 
 async def tg(method, **payload):
+    if payload.get("reply_markup") is None:
+        payload.pop("reply_markup", None)
     for attempt in range(3):
-        try:
             r = await HTTP.post(f"{TG_BASE}/{method}", json=payload)
             data = r.json()
             if data.get("ok"):
