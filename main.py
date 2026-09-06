@@ -429,9 +429,10 @@ def IK(*rows):
 
 def esc(s):
     s = str(s if s is not None else "")
-    return (s.replace("&", "&amp;")
-             .replace("<", "&lt;")
-             .replace(">", "&gt;")
+    s = s.replace("&", "&amp;")
+    s = s.replace("<", "&lt;")
+    s = s.replace(">", "&gt;")
+    return s
 
 
 def trunc(s, n=3500):
