@@ -427,3 +427,39 @@ async def ai_route(text, u):
                       max_tokens=800))
     _cache_set(key, raw)
     return raw
+async def chat_reply(u, chat, text):
+    """Real conversation when the router
+    produced no reply. Uses memories,
+    chat history and study context."""
+    try:
+        base = await ai_context(u)
+        mem = await memory_block(u)
+        hist = await chat_context_block(u)
+        prompt = (
+            "You are StudyOS — a warm, "
+            "witty study companion who "
+            "truly knows this student. "
+            "Reply to their message like "
+            "a smart friend (max 60 words). "
+            "Use their name and the "
+            "memories/context below. If "
+            "they ask a study question, "
+            "answer it helpfully. Never "
+            "invent their statistics. "
+            "Plain text only, no JSON.\n\n"
+            "CONTEXT:\n" + base + "\n"
+            + mem + "\n"
+            + hist
+            + "\n\nMESSAGE:\n" + text)
+        txt = await ai_call(
+            prompt, json_mode=False,
+            max_tokens=300)
+        txt = txt.strip()[:900]
+        await log_chat(u, "ai", txt)
+        await send(chat, esc(txt))
+    except AIError:
+        await send(chat,
+                   "I'm here — my AI "
+                   "brain is just rate-"
+                   "limited for a minute. "
+                   "🧠 Try again soon.")
