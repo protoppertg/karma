@@ -1,17 +1,19 @@
 import re
-import json
 from datetime import timedelta
 from datetime import time as dtime
 from config import LOG
-from database import q, qrow, qval, jd
+from database import (q, qrow, qval,
+                      jd)
 from tg import (send, edit, IK, esc,
-                answer_cb, fm,
-                now_tz, today_d)
+                answer_cb, fm, now_tz,
+                today_d,
+                get_file_bytes)
 import services as S
 from services import (
     get_subjects,
     resolve_subject,
     live_session,
+    live_minutes,
     spent_today,
     cleanup_stale,
     load_day_mods,
@@ -19,6 +21,7 @@ from services import (
     get_extras,
     new_pending,
     get_pending,
+    set_pending_payload,
     confirm_kb,
     card_lines,
     build_candidates,
@@ -26,7 +29,6 @@ from services import (
     apply_revision)
 from engines import (
     day_minutes,
-    build_plan,
     choose_next,
     score_task)
 from parsers import (
@@ -39,26 +41,31 @@ from parsers import (
     detect_energy,
     clampi)
 from brain import (ai_route, AIError,
-                   log_chat,
-                   chat_reply)
-
+                   log_chat, ai_call,
+                   ai_context,
+                   memory_block,
+                   chat_context_block,
+                   ai_transcribe)
 import actions as A
 import views as V
 import media as M
 from views import (
-    MENU_KB, cmd_start, cmd_help,
-    cmd_dashboard, cmd_plan,
-    cmd_homework, cmd_tests,
-    cmd_revision, cmd_mistakes,
-    cmd_classes, cmd_syllabus,
+    MENU_KB, cmd_start,
+    cmd_help, cmd_dashboard,
+    cmd_plan, cmd_homework,
+    cmd_tests, cmd_revision,
+    cmd_mistakes, cmd_classes,
+    cmd_syllabus,
     cmd_analytics, cmd_notes,
     cmd_settings, cmd_review,
-    cmd_dayreview, cmd_doctor,
-    cmd_export, cmd_insights,
-    cmd_memories, do_remember,
-    do_forget, start_quiz,
-    quiz_answer, ob_start,
-    ob_handle, morning_card)
+    cmd_dayreview,
+    cmd_doctor, cmd_export,
+    cmd_insights,
+    cmd_memories,
+    do_remember, do_forget,
+    start_quiz, quiz_answer,
+    ob_start, ob_handle,
+    morning_card)
 
 
 async def lazy_tick(u, now,
@@ -73,7 +80,8 @@ async def lazy_tick(u, now,
            WHERE user_id=$1::uuid
            AND status='pending'
            AND created_at <
-             now() - interval '24 hours'""",
+             now() - interval
+               '24 hours'""",
         u["id"])
     await q(
         """UPDATE pending_actions
@@ -82,16 +90,19 @@ async def lazy_tick(u, now,
            AND status='pending'
            AND kind='session_log'
            AND created_at <
-             now() - interval '2 hours'""",
+             now() - interval
+               '2 hours'""",
         u["id"])
     await q(
         """DELETE FROM update_inbox
            WHERE created_at <
-             now() - interval '2 days'""")
+             now() - interval
+               '2 days'""")
     await q(
         """DELETE FROM mastery_log
            WHERE recorded_at <
-             now() - interval '90 days'""")
+             now() - interval
+               '90 days'""")
     es = u.get("energy_set_at")
     if (u["energy"] != "normal" and es
             and (now - es)
@@ -155,6 +166,43 @@ async def set_energy(u, chat, level):
         chat, msgs[level],
         IK([("▶️ Start Next",
              "nav:next")]))
+
+
+async def chat_reply(u, chat, text):
+    """Real conversation when the
+    router produced no reply. Uses
+    memories, history and context."""
+    try:
+        base = await ai_context(u)
+        mem = await memory_block(u)
+        hist = await chat_context_block(u)
+        prompt = (
+            "You are StudyOS — a warm, "
+            "witty study companion who "
+            "truly knows this student. "
+            "Reply like a smart friend "
+            "(max 60 words). Use their "
+            "name and the memories and "
+            "context below. If they ask "
+            "a study question, answer "
+            "it helpfully. Never invent "
+            "their statistics. Plain "
+            "text only, no JSON.\n\n"
+            "CONTEXT:\n" + base + "\n"
+            + mem + "\n" + hist
+            + "\n\nMESSAGE:\n" + text)
+        txt = await ai_call(
+            prompt, json_mode=False,
+            max_tokens=300)
+        txt = txt.strip()[:900]
+        await log_chat(u, "ai", txt)
+        await send(chat, esc(txt))
+    except AIError:
+        await send(chat,
+                   "I'm here — my AI "
+                   "brain is just rate-"
+                   "limited for a minute. "
+                   "🧠 Try again soon.")
 
 
 BANNED = ("cancel", "move",
@@ -222,7 +270,8 @@ async def try_settings(
         ap = m.group(3)
         mi = m.group(2) or "00"
         if not ap and 1 <= h <= 11:
-            tm = dtime(h + 12, 0)
+            tm = dtime(h + 12,
+                       int(mi))
         else:
             raw = m.group(1) + ":"
             raw += mi
@@ -872,6 +921,27 @@ async def wizard_session_log(
             "\n".join(lines),
             MENU_KB)
         return
+    # not session data — if the
+    # message has NO digits at
+    # all, it's conversation:
+    # cancel the wizard instead
+    # of trapping the user
+    if not re.search(r"\d", text):
+        await q(
+            """UPDATE
+               pending_actions
+               SET status=
+                 'cancelled'
+               WHERE id=$1::uuid""",
+            pid)
+        await send(
+            chat,
+            "Okay — logged that "
+            "session as time-only. "
+            "🏠")
+        await handle_text_msg(
+            u, chat, text)
+        return
     await send(
         chat,
         "Try: '25 18' or '25 "
@@ -991,13 +1061,6 @@ async def session_ctl(
 
 async def handle_voice(u, chat,
                        msg):
-    try:
-        audio = await \
-            M  # placeholder
-    except Exception:
-        pass
-    from tg import get_file_bytes
-    from brain import ai_transcribe
     try:
         audio = await get_file_bytes(
             msg["voice"]["file_id"])
@@ -1231,7 +1294,10 @@ async def handle_text_msg(
            {})
     conf = (routed.get("confidence")
             or "medium").lower()
-        reply = routed.get("reply")
+    # reply may live at top level
+    # OR inside fields (Gemini
+    # puts it in both places)
+    reply = routed.get("reply")
     if not reply:
         reply = f.get("reply")
     if intent in ("chat", "none"):
@@ -1308,8 +1374,7 @@ async def handle_text_msg(
             u, chat, f)
         return
     if intent == "tutor":
-        from views import tutor_reply
-        await tutor_reply(
+        await V.tutor_reply(
             u, chat,
             f.get("question")
             or t)
@@ -1446,16 +1511,12 @@ async def handle_text_msg(
         if not days:
             pc = parse_class(t)
             if pc:
-                days = [{"day":
-                         "monday",
-                         "start":
-                         pc[0]
-                         .strftime(
-                             "%H:%M"),
-                         "end":
-                         pc[1]
-                         .strftime(
-                             "%H:%M")}]
+                days = [{
+                    "day": "daily",
+                    "start": pc[0]
+                    .strftime("%H:%M"),
+                    "end": pc[1]
+                    .strftime("%H:%M")}]
         if not days:
             await send(chat,
                        "What times? "
@@ -1561,8 +1622,6 @@ async def cmd_next(u, chat,
         u, today, mods, cls, extras)
     spent = await spent_today(
         u, today)
-    from services import \
-        live_minutes
     lmins = await live_minutes(
         u, now)
     remaining = max(
@@ -1669,7 +1728,6 @@ async def start_live_session(
              "ses:abandon")]))
 
 
-# ---- callbacks ----
 async def handle_callback(cb):
     data = cb.get("data", "")
     chat = (cb["message"]
@@ -2053,7 +2111,7 @@ async def subj_cb(u, chat, rest):
     fields["subject_id"] = sid
     fields["subject"] = sname
     payload["fields"] = fields
-    await S.set_pending_payload(
+    await set_pending_payload(
         code, payload)
     kind = pend["kind"]
     if kind == "log_session":
@@ -2151,19 +2209,15 @@ async def confirm_cb(
                 == "undo_log":
             await q(
                 """DELETE
-                   FROM
-                     study_sessions
+                   FROM study_sessions
                    WHERE user_id=
                      $1::uuid
                    AND created_at >
-                     now()
-                     - interval
+                     now() - interval
                        '10 minutes'
                    AND source='log'
-                   AND questions_
-                     attempted=$2
-                   AND questions_
-                     correct
+                   AND questions_attempted=$2
+                   AND questions_correct
                      IS NOT DISTINCT
                      FROM $3""",
                 u["id"],
@@ -2417,7 +2471,6 @@ async def confirm_cb(
         code)
 
 
-# ---- entry ----
 async def process_message(msg):
     chat = msg["chat"]["id"]
     try:
