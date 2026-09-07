@@ -39,7 +39,9 @@ from parsers import (
     detect_energy,
     clampi)
 from brain import (ai_route, AIError,
-                   log_chat)
+                   log_chat,
+                   chat_reply)
+
 import actions as A
 import views as V
 import media as M
@@ -1229,18 +1231,28 @@ async def handle_text_msg(
            {})
     conf = (routed.get("confidence")
             or "medium").lower()
-    reply = routed.get("reply")
+        reply = routed.get("reply")
+    if not reply:
+        reply = f.get("reply")
+    if intent in ("chat", "none"):
+        if reply:
+            await log_chat(
+                u, "ai",
+                str(reply))
+            await send(chat,
+                       esc(str(reply)
+                           [:900]),
+                       MENU_KB)
+        else:
+            await chat_reply(
+                u, chat, t)
+        return
     if reply:
         await log_chat(
             u, "ai", str(reply))
         await send(chat,
                    esc(str(reply)
                        [:400]))
-    if intent in ("chat", "none"):
-        if not reply:
-            await cmd_dashboard(
-                u, chat)
-        return
     if intent == "query":
         view = (f.get("view")
                 or "dashboard"
